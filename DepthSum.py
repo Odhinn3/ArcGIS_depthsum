@@ -19,7 +19,7 @@ class DepthSum(object):
         params = []
 
         params.append(arcpy.Parameter(
-            displayName="Input Polyline Layer",
+            displayName="Input profile Polyline Layer",
             name="in_lines",
             datatype="Feature Layer",
             parameterType="Required",
@@ -29,7 +29,7 @@ class DepthSum(object):
         params[0].description = "Input layer with drilling profiles"
 
         params.append(arcpy.Parameter(
-            displayName="Interval between drillholes",
+            displayName="Interval between planned drillholes along profile (m)",
             name="profile_distance",
             datatype="Long",
             parameterType="Required",
@@ -38,7 +38,7 @@ class DepthSum(object):
         params[1].description = "Input the interval between planned drillholes along profiles in meters"
 
         params.append(arcpy.Parameter(
-            displayName="Average depth",
+            displayName="Average depth of planned drillholes (m)",
             name="depth_value",
             datatype="Long",
             parameterType="Required",
@@ -47,7 +47,7 @@ class DepthSum(object):
         params[2].description = "Expected average depth of planned drillholes on the drilling site"
 
         params.append(arcpy.Parameter(
-            displayName="Depth Field Name",
+            displayName="Depth Field Name at polyline layer (new or existing)",
             name="depth_field",
             datatype="String",
             parameterType="Required",
