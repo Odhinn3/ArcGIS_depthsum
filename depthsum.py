@@ -1,106 +1,121 @@
 import arcpy
 import os
-from datetime import datetime
+import datetime
 
 arcpy.env.workspace = r"D:\Temp"
 arcpy.env.overwriteOutput = True
 
-DEFAULT_DISTANCE = 100  # fallback value
-
-#getting the backlog file on a desktop
-def get_desktop_log_folder():
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    log_folder = os.path.join(desktop, "depth_logs")
-
-    if not os.path.exists(log_folder):
-        os.makedirs(log_folder)
-        arcpy.AddMessage(f"Created log folder: {log_folder}")
-    else:
-        arcpy.AddMessage(f"Using existing log folder: {log_folder}")
-
-    return log_folder
-
-#calculating the total depth
-def depthsum(layer, distance, depth, field):
+def depthsum(layer, distance, depth, field, log_folder):
+    """Updates a field with calculated depth and logs to file."""
     try:
-        log_folder = get_desktop_log_folder()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = os.path.join(log_folder, f"depth_log_{timestamp}.txt")
+        with arcpy.da.UpdateCursor(layer, ["SHAPE@LENGTH", field]) as cursor:
+            sum_depth = 0
+            sum_profiles = 0
 
-        sum_depth = 0
-        sum_profiles = 0
+            # Prepare log file path
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            if not os.path.isdir(log_folder):
+                os.makedirs(log_folder)
 
-        if not arcpy.Exists(layer):
-            raise ValueError("Input layer does not exist or is not accessible")
+            output_file = os.path.join(log_folder, f"depth_log_{timestamp}.txt")
+            with open(output_file, "w") as file:
+                for row in cursor:
+                    if distance == 0:
+                        arcpy.AddWarning("Distance is zero, using default 100 meters")
+                        distance = 100
 
-        row_count = int(arcpy.GetCount_management(layer)[0])
-        if row_count == 0:
-            arcpy.AddWarning("Input layer is empty. No features to process.")
-            return
+                    row[1] = (round(row[0] / distance) + 1) * depth
+                    file.write(f"{round(row[0])} {row[1]}\n")
 
-        with arcpy.da.UpdateCursor(layer, ["SHAPE@LENGTH", field]) as cursor, open(output_file, "w") as file:
-            arcpy.AddMessage(f"Log file created: {output_file}")
-
-            for row in cursor:
-                applied_distance = distance if distance > 0 else DEFAULT_DISTANCE
-                if distance <= 0:
-                    arcpy.AddWarning("Distance is zero or negative — using default 100 meters.")
-
-                line_length = row[0]
-                row[1] = (round(line_length / applied_distance) + 1) * depth
-
-                file.write(f"{round(line_length)} {row[1]}\n")
-
-                sum_depth += row[1]
-                sum_profiles += 1
-
-                try:
+                    sum_depth += row[1]
+                    sum_profiles += 1
                     cursor.updateRow(row)
-                except Exception as update_err:
-                    arcpy.AddWarning(f"Could not update row: {update_err}")
+                    arcpy.AddMessage("Row updated")
 
-            file.write(f"Total depth: {sum_depth}\nNumber of profiles: {sum_profiles}")
-            arcpy.AddMessage(f"Completed: Total depth = {sum_depth}, Profiles = {sum_profiles}")
+                file.write(f"Total depth: {sum_depth}\nNumber of profiles: {sum_profiles}")
+                arcpy.AddMessage(f"Total depth: {sum_depth}")
 
     except Exception as e:
         arcpy.AddError(f"Error in depthsum(): {e}")
 
+def generate_points_along_lines(line_layer, spacing, output_fc):
+    """Generates points along polylines with LineID and PointNumber fields."""
+    try:
+        arcpy.AddMessage(f"Generating points every {spacing} meters")
+
+        spatial_ref = arcpy.Describe(line_layer).spatialReference
+        arcpy.CreateFeatureclass_management(
+            out_path=os.path.dirname(output_fc),
+            out_name=os.path.basename(output_fc),
+            geometry_type="POINT",
+            spatial_reference=spatial_ref
+        )
+
+        # Add LineID and PointNumber fields
+        arcpy.AddField_management(output_fc, "LineID", "LONG")
+        arcpy.AddField_management(output_fc, "PointNumber", "LONG")
+
+        with arcpy.da.SearchCursor(line_layer, ["OID@", "SHAPE@"]) as s_cursor, \
+             arcpy.da.InsertCursor(output_fc, ["SHAPE@", "LineID", "PointNumber"]) as i_cursor:
+
+            for line_id, shape in s_cursor:
+                length = shape.length
+                position = 0.0
+                point_number = 1
+
+                while position < length:
+                    point_geom = shape.positionAlongLine(position)
+                    i_cursor.insertRow([point_geom, line_id, point_number])
+                    position += spacing
+                    point_number += 1
+
+        arcpy.AddMessage(f"Points with LineID and PointNumber saved to: {output_fc}")
+
+    except Exception as e:
+        arcpy.AddError(f"Error generating points: {e}")
 
 def main():
     try:
+        # Input parameters
         layer = arcpy.GetParameterAsText(0)
-        d = arcpy.GetParameter(1)
-        a = arcpy.GetParameter(2)
-        f = arcpy.GetParameterAsText(3)
+        distance = int(arcpy.GetParameter(1))
+        depth = int(arcpy.GetParameter(2))
+        field = arcpy.GetParameterAsText(3)
+        spacing = int(arcpy.GetParameter(4))
 
-        try:
-            distance = int(d)
-        except:
-            raise ValueError("Distance must be an integer")
+        # Create log on Desktop
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        log_folder = os.path.join(desktop, "DepthLogs")
 
-        try:
-            depth = int(a)
-        except:
-            raise ValueError("Depth must be an integer")
+        arcpy.AddMessage("Parameters received successfully")
 
-        arcpy.AddMessage("All parameters received successfully.")
-
+        # Check geometry type
         desc = arcpy.Describe(layer)
         if desc.shapeType != "Polyline":
-            raise ValueError("Input feature class must be a Polyline")
+            arcpy.AddError("Input feature class must be a Polyline")
+            raise ValueError("Invalid geometry type")
 
+        # Add and fill LineID field
         field_names = [fld.name for fld in arcpy.ListFields(layer)]
-        if f not in field_names:
-            arcpy.AddMessage(f"Field '{f}' not found. Creating it...")
-            arcpy.AddField_management(layer, f, "LONG")
-        else:
-            arcpy.AddMessage(f"Field '{f}' already exists.")
+        if "LineID" not in field_names:
+            arcpy.AddField_management(layer, "LineID", "LONG")
 
-        depthsum(layer, distance, depth, f)
+        with arcpy.da.UpdateCursor(layer, ["OID@", "LineID"]) as cursor:
+            for oid, _ in cursor:
+                cursor.updateRow([oid, oid])
+
+        # Add depth field if needed
+        if field not in field_names:
+            arcpy.AddField_management(layer, field, "LONG")
+
+        # Run depthsum and generate points
+        depthsum(layer, distance, depth, field, log_folder)
+
+        point_output_fc = os.path.join(arcpy.env.workspace, "generated_points")
+        generate_points_along_lines(layer, spacing, point_output_fc)
 
     except Exception as e:
-        arcpy.AddError(f"Script failed: {e}")
-
+        arcpy.AddError("Unexpected error: " + str(e))
 
 if __name__ == "__main__":
     main()
