@@ -2,65 +2,86 @@
 import arcpy
 import os
 import datetime
+import math
 
 class Toolbox(object):
     def __init__(self):
-        self.label = "Drillholes total depth calculating"
-        self.alias = "depth_sum"
-        self.tools = [DepthSum]
+        self.label = "Drillholes from Polygon Generator"
+        self.alias = "polygon_to_profiles"
+        self.tools = [PolygonToProfiles]
 
-class DepthSum(object):
+class PolygonToProfiles(object):
     def __init__(self):
-        self.label = "Total depth calculator and collars generator"
-        self.description = "Calculates total depth on profiles and generates collars with LineID and PointNumber"
+        self.label = "Generate Profiles and Collars from Polygon"
+        self.description = "Generates polylines at specified azimuth and spacing inside a polygon, then calculates total depth or generates collar points."
         self.canRunInBackground = False
 
-    def getParameterInfo(self):
+    @staticmethod
+    def getParameterInfo():
         params = []
 
         params.append(arcpy.Parameter(
-            displayName="Input profile Polyline Layer",
-            name="in_lines",
+            displayName="Input exploration area polygon Layer",
+            name="in_polygons",
             datatype="Feature Layer",
             parameterType="Required",
             direction="Input"
         ))
-        params[0].filter.list = ["Polyline"]
-        params[0].description = "Input layer with drilling profiles"
+        params[0].filter.list = ["Polygon"]
 
         params.append(arcpy.Parameter(
-            displayName="Interval between planned drillholes along profile (m)",
-            name="profile_distance",
+            displayName="Input desired profile spacing (meters)",
+            name="profile_spacing",
             datatype="Long",
             parameterType="Required",
             direction="Input"
         ))
-        params[1].description = "Input the interval between planned drillholes along profiles in meters"
 
         params.append(arcpy.Parameter(
-            displayName="Average depth of planned drillholes (m)",
+            displayName="Input desired profiles azimuth (degrees)",
+            name="azimuth",
+            datatype="Long",
+            parameterType="Required",
+            direction="Input"
+        ))
+
+        params.append(arcpy.Parameter(
+            displayName="Input interval between points on profiles (meters)",
+            name="point_interval",
+            datatype="Long",
+            parameterType="Required",
+            direction="Input"
+        ))
+
+        params.append(arcpy.Parameter(
+            displayName="Input expected average depth of planned drillholes (meters)",
             name="depth_value",
             datatype="Long",
-            parameterType="Required",
+            parameterType="Optional",
             direction="Input"
         ))
-        params[2].description = "Expected average depth of planned drillholes on the drilling site"
 
         params.append(arcpy.Parameter(
-            displayName="Depth Field Name at polyline layer (new or existing)",
-            name="depth_field",
-            datatype="String",
-            parameterType="Required",
+            displayName="Soil geochemistry mode (depths are not calculated)",
+            name="geochem_mode",
+            datatype="Boolean",
+            parameterType="Optional",
             direction="Input"
         ))
-        params[3].description = "Desired name of the attribute field at profile layer, where total depth will be written"
+        params[5].value = False
 
         return params
 
-    def isLicensed(self):
+    @staticmethod
+    def isLicensed():
         return True
 
-    def updateParameters(self, parameters):
+    @staticmethod
+    def updateParameters(parameters):
+        if parameters[5].value:  # Geochem mode
+            parameters[4].enabled = False
+        else:
+            parameters[4].enabled = True
         return
 
     def updateMessages(self, parameters):
@@ -68,76 +89,98 @@ class DepthSum(object):
 
     def execute(self, parameters, messages):
         try:
-            # Get parameters
-            layer = parameters[0].valueAsText
-            distance = int(parameters[1].value)
-            depth = int(parameters[2].value)
-            field = parameters[3].valueAsText
+            polygon_layer = parameters[0].valueAsText
+            spacing = parameters[1].value
+            azimuth = parameters[2].value
+            point_interval = parameters[3].value
+            avg_depth = parameters[4].value if not parameters[5].value else None
+            geochem_mode = parameters[5].value
 
             arcpy.env.overwriteOutput = True
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")
             log_folder = os.path.join(desktop, "DepthLogs")
+            scratch_gdb = arcpy.env.scratchGDB
 
-            desc = arcpy.Describe(layer)
-            if desc.shapeType != "Polyline":
-                raise ValueError("Input feature class must be a Polyline")
+            profile_lines = os.path.join(scratch_gdb, "generated_profiles")
+            collar_points = os.path.join(scratch_gdb, "generated_points")
 
-            # Add LineID field if missing
-            field_names = [f.name for f in arcpy.ListFields(layer)]
-            if "LineID" not in field_names:
-                arcpy.AddField_management(layer, "LineID", "LONG")
+            self.generate_profiles(polygon_layer, spacing, azimuth, profile_lines)
+            self.generate_points(profile_lines, point_interval, collar_points)
 
-            with arcpy.da.UpdateCursor(layer, ["OID@", "LineID"]) as cursor:
-                for oid, _ in cursor:
-                    cursor.updateRow([oid, oid])
+            if not geochem_mode:
+                self.add_depths(profile_lines, point_interval, avg_depth, "TotalMeterage", log_folder)
 
-            # Add depth field if needed
-            if field not in field_names:
-                arcpy.AddField_management(layer, field, "LONG")
+            self.add_layer_to_map(profile_lines, "Profiles")
+            self.add_layer_to_map(collar_points, "Collar Points")
 
-            self.depthsum(layer, distance, depth, field, log_folder)
-
-            # Output points to scratch GDB
-            point_output_fc = os.path.join(arcpy.env.scratchGDB, "generated_points")
-            self.generate_points(layer, distance, point_output_fc)
-
-            arcpy.AddMessage("All tasks completed successfully.")
+            arcpy.SetParameter(0, collar_points)
 
         except Exception as e:
             arcpy.AddError("Execution failed: " + str(e))
 
-    def depthsum(self, layer, distance, depth, field, log_folder):
-        """Updates depth field based on polyline length and logs results."""
+    @staticmethod
+    def generate_profiles(polygon_layer, spacing, azimuth, output_fc):
         try:
-            with arcpy.da.UpdateCursor(layer, ["SHAPE@LENGTH", field]) as cursor:
-                sum_depth = 0
-                sum_profiles = 0
+            desc = arcpy.Describe(polygon_layer)
+            spatial_ref = desc.spatialReference
 
-                if not os.path.isdir(log_folder):
-                    os.makedirs(log_folder)
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_file = os.path.join(log_folder, f"depth_log_{timestamp}.txt")
+            # Если входной слой в географической СК — перепроецируем в Mercator
+            if spatial_ref.type == "Geographic":
+                arcpy.AddMessage("Перепроецируем полигон в WGS 1984 Web Mercator для расчётов в метрах.")
+                projected_polygon = os.path.join(arcpy.env.scratchGDB, "projected_polygon")
+                mercator_sr = arcpy.SpatialReference(3857)  # WGS 1984 Web Mercator Auxiliary Sphere
+                arcpy.Project_management(polygon_layer, projected_polygon, mercator_sr)
+                polygon_layer = projected_polygon
+                spatial_ref = mercator_sr
 
-                with open(output_file, "w") as file:
-                    for row in cursor:
-                        if distance == 0:
-                            arcpy.AddWarning("Distance is zero, using default 100 meters")
-                            distance = 100
+            # Создаём временный слой с линиями
+            temp_lines = os.path.join(arcpy.env.scratchGDB, "temp_lines")
+            arcpy.CreateFeatureclass_management(
+                out_path=os.path.dirname(temp_lines),
+                out_name=os.path.basename(temp_lines),
+                geometry_type="POLYLINE",
+                spatial_reference=spatial_ref
+            )
+            arcpy.AddField_management(temp_lines, "LineID", "LONG")
 
-                        row[1] = (round(row[0] / distance) + 1) * depth
-                        file.write(f"{round(row[0])} {row[1]}\n")
-                        sum_depth += row[1]
-                        sum_profiles += 1
-                        cursor.updateRow(row)
+            azimuth_rad = math.radians(azimuth)
 
-                    file.write(f"Total depth: {sum_depth}\nNumber of profiles: {sum_profiles}")
-                    arcpy.AddMessage(f"Total depth written to: {output_file}")
+            # Правильная интерпретация азимута: 0° — север, 90° — восток
+            dx = math.sin(azimuth_rad)  # восточное направление
+            dy = math.cos(azimuth_rad)  # северное направление
+            nx = -dy  # направление смещения профилей — ортогонально (на запад)
+            ny = dx
+
+            with arcpy.da.InsertCursor(temp_lines, ["SHAPE@", "LineID"]) as insert_cursor:
+                with arcpy.da.SearchCursor(polygon_layer, ["SHAPE@", "OID@"]) as search_cursor:
+                    for polygon, oid in search_cursor:
+                        center = polygon.centroid
+                        extent = polygon.extent
+                        diagonal = math.hypot(extent.width, extent.height)
+                        max_offset = diagonal
+
+                        distance = -max_offset
+                        line_id = 1
+                        while distance <= max_offset:
+                            cx = center.X + nx * distance
+                            cy = center.Y + ny * distance
+
+                            start_point = arcpy.Point(cx - dx * 10000, cy - dy * 10000)
+                            end_point = arcpy.Point(cx + dx * 10000, cy + dy * 10000)
+                            line = arcpy.Polyline(arcpy.Array([start_point, end_point]), spatial_ref)
+
+                            insert_cursor.insertRow([line, line_id])
+                            line_id += 1
+                            distance += spacing
+
+            # Обрезаем профили по границе полигона
+            arcpy.Clip_analysis(temp_lines, polygon_layer, output_fc)
 
         except Exception as e:
-            arcpy.AddError(f"Error in depthsum(): {e}")
+            arcpy.AddError(f"Error generating profiles: {e}")
 
-    def generate_points(self, line_layer, distance, output_fc):
-        """Generates points along lines with LineID and PointNumber."""
+    @staticmethod
+    def generate_points(line_layer, interval, output_fc):
         try:
             spatial_ref = arcpy.Describe(line_layer).spatialReference
             arcpy.CreateFeatureclass_management(
@@ -150,21 +193,54 @@ class DepthSum(object):
             arcpy.AddField_management(output_fc, "LineID", "LONG")
             arcpy.AddField_management(output_fc, "PointNumber", "LONG")
 
-            with arcpy.da.SearchCursor(line_layer, ["OID@", "SHAPE@"]) as s_cursor, \
-                 arcpy.da.InsertCursor(output_fc, ["SHAPE@", "LineID", "PointNumber"]) as i_cursor:
-
-                for line_id, shape in s_cursor:
+            with arcpy.da.SearchCursor(line_layer, ["LineID", "SHAPE@"]) as line_cursor, \
+                 arcpy.da.InsertCursor(output_fc, ["SHAPE@", "LineID", "PointNumber"]) as point_cursor:
+                for line_id, shape in line_cursor:
                     length = shape.length
-                    position = 0.0
-                    point_number = 1
-
-                    while position < length:
-                        point_geom = shape.positionAlongLine(position)
-                        i_cursor.insertRow([point_geom, line_id, point_number])
-                        position += distance
-                        point_number += 1
-
-            arcpy.AddMessage(f"Points generated and saved to: {output_fc}")
+                    pos = 0.0
+                    point_num = 1
+                    while pos < length:
+                        point = shape.positionAlongLine(pos)
+                        point_cursor.insertRow([point, line_id, point_num])
+                        pos += interval
+                        point_num += 1
 
         except Exception as e:
             arcpy.AddError(f"Error generating points: {e}")
+
+    @staticmethod
+    def add_depths(line_layer, interval, avg_depth, field, log_folder):
+        try:
+            if not os.path.exists(log_folder):
+                os.makedirs(log_folder)
+
+            existing_fields = [f.name for f in arcpy.ListFields(line_layer)]
+            if field not in existing_fields:
+                arcpy.AddField_management(line_layer, field, "DOUBLE")
+
+            log_file = os.path.join(log_folder, f"depth_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+            with arcpy.da.UpdateCursor(line_layer, ["SHAPE@LENGTH", field]) as cursor, open(log_file, "w") as file:
+                total_depth = 0
+                for row in cursor:
+                    length = row[0]
+                    n_points = int(length / interval) + 1
+                    depth = n_points * avg_depth
+                    row[1] = depth
+                    cursor.updateRow(row)
+                    total_depth += depth
+                    file.write(f"{length:.2f} -> {depth}\n")
+                file.write(f"Total depth: {total_depth}")
+
+        except Exception as e:
+            arcpy.AddError(f"Error in add_depths: {e}")
+
+    @staticmethod
+    def add_layer_to_map(layer_path, layer_name):
+        try:
+            aprx = arcpy.mp.ArcGISProject("CURRENT")
+            active_map = aprx.activeMap
+            if active_map:
+                active_map.addDataFromPath(layer_path)
+                arcpy.AddMessage(f"Добавлен слой на карту: {layer_name}")
+        except Exception as e:
+            arcpy.AddWarning(f"Не удалось добавить слой {layer_name} на карту: {e}")
