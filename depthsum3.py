@@ -91,7 +91,6 @@ class PolygonToProfiles(object):
     def execute(self, parameters, messages):
         try:
             polygon_layer = parameters[0].valueAsText
-            arcpy.AddMessage(str(polygon_layer))
             spacing = parameters[1].value
             azimuth = parameters[2].value
             point_interval = parameters[3].value
@@ -100,33 +99,64 @@ class PolygonToProfiles(object):
 
             arcpy.env.overwriteOutput = True
 
-            # Создаём scratch.gdb рядом с .pyt, если её нет
             toolbox_folder = os.path.dirname(__file__)
             custom_scratch_gdb = os.path.join(toolbox_folder, "scratch.gdb")
             if not arcpy.Exists(custom_scratch_gdb):
-                arcpy.CreateFileGDB_management(toolbox_folder, "scratch.gdb")
+                arcpy.CreateFileGDB_management(toolbox_folder, "scratch")
 
             arcpy.env.scratchWorkspace = custom_scratch_gdb
             scratch_gdb = arcpy.env.scratchGDB
-            arcpy.AddMessage(f"Временная GDB установлена: {scratch_gdb}")
 
-            profile_lines = os.path.join(scratch_gdb, "generated_profiles")
-            collar_points = os.path.join(scratch_gdb, "generated_points")
+            profile_lines = os.path.join(scratch_gdb, "profiles")
+            collar_points = os.path.join(scratch_gdb, "collars")
 
             fishnet_fc = self.generate_profiles(polygon_layer, spacing, azimuth, profile_lines)
-            self.add_layer_to_map(fishnet_fc, "Profiles")
-            # self.generate_points(profile_lines, point_interval, collar_points)
+            self.generate_points(profile_lines, point_interval, collar_points)
+
+            # Обрезаем линии и точки по полигону
+            arcpy.AddMessage("Обрезаю точки и линии...")
+            self.cutting_by_polygon(polygon_layer, profile_lines, collar_points)
 
             if not geochem_mode:
                 self.add_depths(profile_lines, point_interval, avg_depth, "TotalMeterage",
                                 os.path.join(os.path.expanduser("~"), "Desktop", "DepthLogs"))
 
-            # self.add_layer_to_map(collar_points, "Collar Points")
-
+            self.add_layer_to_map(profile_lines, "profiles")
+            self.add_layer_to_map(collar_points, "collars")
             arcpy.SetParameter(0, collar_points)
 
         except Exception as e:
             arcpy.AddError("Execution failed: " + str(e))
+
+        try:
+            arcpy.AddMessage("Удаляю временные классы объектов")
+            proj_fc = os.path.join(arcpy.env.scratchGDB, "projected_polygon")
+            if arcpy.Exists(proj_fc):
+                arcpy.Delete_management(proj_fc)
+                arcpy.AddMessage("projected_polygon удалён")
+            raw_fc = os.path.join(arcpy.env.scratchGDB, "raw_fishnet")
+            if arcpy.Exists(raw_fc):
+                arcpy.Delete_management(raw_fc)
+                arcpy.AddMessage("raw_fishnet удалён")
+            temp_fc = os.path.join(arcpy.env.scratchGDB, "temp_fishnet_geomfix")
+            if arcpy.Exists(temp_fc):
+                arcpy.Delete_management(temp_fc)
+                arcpy.AddMessage("temp_fishnet удалён")
+            rotated_fc = os.path.join(arcpy.env.scratchGDB, "rotated_fishnet")
+            if arcpy.Exists(rotated_fc):
+                arcpy.Delete_management(rotated_fc)
+                arcpy.AddMessage("rotated_fishnet удалён")
+            pivot_fc = os.path.join(arcpy.env.scratchGDB, "pivot_point_fc")
+            if arcpy.Exists(pivot_fc):
+                arcpy.Delete_management(pivot_fc)
+                arcpy.AddMessage("Pivot_point_fc удалён...")
+            generated_fc = os.path.join(arcpy.env.scratchGDB, "generated_points")
+            if arcpy.Exists(generated_fc):
+                arcpy.Delete_management(generated_fc)
+                arcpy.AddMessage("generated_points удалён...")
+
+        except:
+            arcpy.AddWarning("Не удалось удалить временные объекты")
 
     @staticmethod
     def generate_profiles(polygon_layer, spacing, azimuth, output_fc):
@@ -196,7 +226,7 @@ class PolygonToProfiles(object):
             arcpy.CopyFeatures_management(raw_fishnet, temp_fishnet)
 
             # Поворот fishnet вручную
-            rotated_fishnet = os.path.join(arcpy.env.scratchGDB, "rotated_fishnet")
+            rotated_fishnet = os.path.join(arcpy.env.scratchGDB, "profiles")
             if arcpy.Exists(rotated_fishnet):
                 arcpy.Delete_management(rotated_fishnet)
 
@@ -220,7 +250,6 @@ class PolygonToProfiles(object):
                     arcpy.da.InsertCursor(rotated_fishnet, ["SHAPE@"]) as insert_cursor:
                 for row in search_cursor:
                     geom = row[0]
-                    arcpy.AddMessage(f"Тип геометрии: {type(geom)}")
 
                     # Получаем координаты всех точек в полилинии
                     points = [p for p in geom.getPart(0)]
@@ -249,49 +278,64 @@ class PolygonToProfiles(object):
             arcpy.AddMessage(f"Фишнет повернут и сохранён в: {rotated_fishnet}")
             return rotated_fishnet
 
-
-
-            # arcpy.Rotate_management(
-            #     raw_fishnet,  # in_features
-            #     rotated_fishnet,  # out_feature_class
-            #     pivot_fc,  # pivot_point
-            #     angle,  # angle
-            #     "GEOGRAPHIC"  # rotate_method
-            # )
-
-            arcpy.AddMessage(f"Повернутый фишнет: {rotated_fishnet}")
-            return rotated_fishnet
-
         except Exception as e:
             arcpy.AddError(f"Ошибка в generate_profiles: {e}")
 
-    # @staticmethod
-    # def generate_points(line_layer, interval, output_fc):
-    #     try:
-    #         spatial_ref = arcpy.Describe(line_layer).spatialReference
-    #         arcpy.CreateFeatureclass_management(
-    #             out_path=os.path.dirname(output_fc),
-    #             out_name=os.path.basename(output_fc),
-    #             geometry_type="POINT",
-    #             spatial_reference=spatial_ref
-    #         )
-    #         arcpy.AddField_management(output_fc, "LineID", "LONG")
-    #         arcpy.AddField_management(output_fc, "PointNumber", "LONG")
-    #
-    #         with arcpy.da.SearchCursor(line_layer, ["OID@", "SHAPE@"]) as line_cursor, \
-    #                 arcpy.da.InsertCursor(output_fc, ["SHAPE@", "LineID", "PointNumber"]) as point_cursor:
-    #             for line_id, shape in line_cursor:
-    #                 length = shape.length
-    #                 pos = 0.0
-    #                 point_num = 1
-    #                 while pos < length:
-    #                     point = shape.positionAlongLine(pos)
-    #                     point_cursor.insertRow([point, line_id, point_num])
-    #                     pos += interval
-    #                     point_num += 1
-    #
-    #     except Exception as e:
-    #         arcpy.AddError(f"Error generating points: {e}")
+    @staticmethod
+    def generate_points(line_layer, interval, output_fc):
+        arcpy.AddMessage("executing generating points...")
+        try:
+            spatial_ref = arcpy.Describe(line_layer).spatialReference
+            arcpy.AddMessage("Spatial reference got successfully")
+            arcpy.CreateFeatureclass_management(
+                out_path=os.path.dirname(output_fc),
+                out_name=os.path.basename(output_fc),
+                geometry_type="POINT",
+                spatial_reference=spatial_ref
+            )
+            arcpy.AddMessage("Points created successfully")
+            arcpy.AddField_management(output_fc, "LineID", "LONG")
+            arcpy.AddField_management(output_fc, "PointNumber", "LONG")
+
+            with arcpy.da.SearchCursor(line_layer, ["OID@", "SHAPE@"]) as line_cursor, \
+                    arcpy.da.InsertCursor(output_fc, ["SHAPE@", "LineID", "PointNumber"]) as point_cursor:
+                for line_id, shape in line_cursor:
+                    length = shape.length
+                    pos = 0.0
+                    point_num = 1
+                    while pos < length:
+                        point = shape.positionAlongLine(pos)
+                        point_cursor.insertRow([point, line_id, point_num])
+                        pos += interval
+                        point_num += 1
+
+        except Exception as e:
+            arcpy.AddError(f"Error generating points: {e}")
+
+
+    @staticmethod
+    def cutting_by_polygon(polygon_layer, line_fc, point_fc):
+        try:
+            clipped_lines = line_fc + "_clipped"
+            clipped_points = point_fc + "_clipped"
+
+            if arcpy.Exists(clipped_lines):
+                arcpy.Delete_management(clipped_lines)
+            if arcpy.Exists(clipped_points):
+                arcpy.Delete_management(clipped_points)
+
+            arcpy.Clip_analysis(line_fc, polygon_layer, clipped_lines)
+            arcpy.Clip_analysis(point_fc, polygon_layer, clipped_points)
+
+            arcpy.Delete_management(line_fc)
+            arcpy.Delete_management(point_fc)
+            arcpy.Rename_management(clipped_lines, line_fc)
+            arcpy.Rename_management(clipped_points, point_fc)
+
+            arcpy.AddMessage("Слои успешно обрезаны по полигону.")
+        except Exception as e:
+            arcpy.AddError("Ошибка при обрезке по полигону: " + str(e))
+
 
     @staticmethod
     def add_depths(line_layer, interval, avg_depth, field, log_folder):
