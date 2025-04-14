@@ -122,7 +122,6 @@ class PolygonToProfiles(object):
             fishnet_fc = self.generate_profiles(polygon_layer, spacing, azimuth, profile_lines, utm_zone)
             self.generate_points(profile_lines, point_interval, collar_points)
 
-            arcpy.AddMessage("Обрезаю точки и линии...")
             self.cutting_by_polygon(polygon_layer, profile_lines, collar_points)
 
             if not geochem_mode:
@@ -137,14 +136,13 @@ class PolygonToProfiles(object):
             arcpy.AddError("Execution failed: " + str(e))
 
         try:
-            arcpy.AddMessage("Удаляю временные классы объектов")
             for name in ["projected_polygon", "raw_fishnet", "temp_fishnet_geomfix", "rotated_fishnet", "pivot_point_fc", "generated_points"]:
                 path = os.path.join(arcpy.env.scratchGDB, name)
                 if arcpy.Exists(path):
                     arcpy.Delete_management(path)
                     arcpy.AddMessage(f"{name} удалён")
         except:
-            arcpy.AddWarning("Не удалось удалить временные объекты")
+            arcpy.AddWarning("Temporary objects are not deleted")
 
     @staticmethod
     def generate_profiles(polygon_layer, spacing, azimuth, output_fc, utm_zone):
@@ -153,12 +151,12 @@ class PolygonToProfiles(object):
             spatial_ref = desc.spatialReference
 
             needs_projection = spatial_ref.type == "Geographic"
-            arcpy.AddMessage(f"Текущая СК: {spatial_ref.name}")
+
 
             if needs_projection:
                 epsg_code = 32600 + int(utm_zone)
                 utm_sr = arcpy.SpatialReference(epsg_code)
-                arcpy.AddMessage(f"Перепроецируем полигон в UTM Zone {utm_zone} (EPSG:{epsg_code})...")
+
                 projected_polygon = os.path.join(arcpy.env.scratchGDB, "projected_polygon")
                 if arcpy.Exists(projected_polygon):
                     arcpy.Delete_management(projected_polygon)
@@ -166,7 +164,7 @@ class PolygonToProfiles(object):
                 polygon_layer = projected_polygon
                 spatial_ref = utm_sr
             else:
-                arcpy.AddMessage("Полигон уже в метрической СК, перепроецирование не требуется.")
+                arcpy.AddMessage("Polygon reprojection is not required.")
 
             extent = arcpy.Describe(polygon_layer).extent
             with arcpy.da.SearchCursor(polygon_layer, ["SHAPE@"]) as cursor:
@@ -189,7 +187,6 @@ class PolygonToProfiles(object):
             )
 
             arcpy.DefineProjection_management(raw_fishnet, spatial_ref)
-            arcpy.AddMessage(f"Фишнет создан: {raw_fishnet}")
 
             temp_fishnet = os.path.join(arcpy.env.scratchGDB, "temp_fishnet_geomfix")
             if arcpy.Exists(temp_fishnet):
@@ -207,7 +204,6 @@ class PolygonToProfiles(object):
                 spatial_reference=spatial_ref
             )
 
-            arcpy.AddMessage(f"Создаём повёрнутый фишнет на {azimuth}°...")
             angle_radians = math.radians(-azimuth)
             pivot_point = arcpy.Point(centroid.X, centroid.Y)
 
@@ -226,15 +222,13 @@ class PolygonToProfiles(object):
                     rotated_geom = arcpy.Polyline(arcpy.Array(rotated_points))
                     insert_cursor.insertRow([rotated_geom])
 
-            arcpy.AddMessage(f"Фишнет повернут и сохранён в: {rotated_fishnet}")
             return rotated_fishnet
 
         except Exception as e:
-            arcpy.AddError(f"Ошибка в generate_profiles: {e}")
+            arcpy.AddError(f"Generate profiles error: {e}")
 
     @staticmethod
     def generate_points(line_layer, interval, output_fc):
-        arcpy.AddMessage("executing generating points...")
         try:
             spatial_ref = arcpy.Describe(line_layer).spatialReference
             arcpy.CreateFeatureclass_management(
@@ -243,11 +237,11 @@ class PolygonToProfiles(object):
                 geometry_type="POINT",
                 spatial_reference=spatial_ref
             )
-            arcpy.AddField_management(output_fc, "LineID", "LONG")
+            arcpy.AddField_management(output_fc, "ProfileNumber", "LONG")
             arcpy.AddField_management(output_fc, "PointNumber", "LONG")
 
             with arcpy.da.SearchCursor(line_layer, ["OID@", "SHAPE@"]) as line_cursor, \
-                    arcpy.da.InsertCursor(output_fc, ["SHAPE@", "LineID", "PointNumber"]) as point_cursor:
+                    arcpy.da.InsertCursor(output_fc, ["SHAPE@", "ProfileNumber", "PointNumber"]) as point_cursor:
                 for line_id, shape in line_cursor:
                     length = shape.length
                     pos = 0.0
@@ -280,9 +274,39 @@ class PolygonToProfiles(object):
             arcpy.Rename_management(clipped_lines, line_fc)
             arcpy.Rename_management(clipped_points, point_fc)
 
-            arcpy.AddMessage("Слои успешно обрезаны по полигону.")
+            CuttingHelper.assign_sequential_id(line_fc, "ID")
+
+            joined_fc = os.path.join(arcpy.env.scratchGDB, "joined_points_with_lines")
+            if arcpy.Exists(joined_fc):
+                arcpy.Delete_management(joined_fc)
+
+            arcpy.SpatialJoin_analysis(
+                target_features=point_fc,
+                join_features=line_fc,
+                out_feature_class=joined_fc,
+                join_operation="JOIN_ONE_TO_ONE",
+                join_type="KEEP_COMMON",
+                match_option="INTERSECT"
+            )
+
+            with arcpy.da.UpdateCursor(point_fc, ["OID@", "ProfileNumber"]) as point_cursor:
+                id_map = {row[0]: row[1] for row in point_cursor}
+
+            with arcpy.da.SearchCursor(joined_fc, ["TARGET_FID", "ID"]) as join_cursor:
+                update_dict = {row[0]: row[1] for row in join_cursor}
+
+            with arcpy.da.UpdateCursor(point_fc, ["OID@", "ProfileNumber"]) as cursor:
+                for row in cursor:
+                    if row[0] in update_dict:
+                        row[1] = update_dict[row[0]]
+                        cursor.updateRow(row)
+
+            arcpy.Delete_management(joined_fc)
+
+            CuttingHelper.assign_sequential_id(point_fc, "PointNumber")
+
         except Exception as e:
-            arcpy.AddError("Ошибка при обрезке по полигону: " + str(e))
+            arcpy.AddError("Cutting by polygon error: " + str(e))
 
     @staticmethod
     def add_depths(line_layer, interval, avg_depth, field, log_folder):
@@ -306,6 +330,7 @@ class PolygonToProfiles(object):
                     total_depth += depth
                     file.write(f"{length:.2f} -> {depth}\n")
                 file.write(f"Total depth: {total_depth}")
+                arcpy.AddMessage(f"Total meterage of planned drilling campaign: {total_depth}")
 
         except Exception as e:
             arcpy.AddError(f"Error in add_depths: {e}")
@@ -317,6 +342,21 @@ class PolygonToProfiles(object):
             active_map = aprx.activeMap
             if active_map:
                 active_map.addDataFromPath(layer_path)
-                arcpy.AddMessage(f"Добавлен слой на карту: {layer_name}")
         except Exception as e:
-            arcpy.AddWarning(f"Не удалось добавить слой {layer_name} на карту: {e}")
+            arcpy.AddWarning(f"Layer {layer_name} was not added to map {e}")
+
+class CuttingHelper:
+    @staticmethod
+    def assign_sequential_id(fc, field_name):
+        # Добавить поле, если его ещё нет
+        existing_fields = [f.name for f in arcpy.ListFields(fc)]
+        if field_name not in existing_fields:
+            arcpy.AddField_management(fc, field_name, "LONG")
+
+        # Присвоить значения ID по порядку
+        with arcpy.da.UpdateCursor(fc, [field_name]) as cursor:
+            counter = 1
+            for row in cursor:
+                row[0] = counter
+                cursor.updateRow(row)
+                counter += 1
