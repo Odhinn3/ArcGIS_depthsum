@@ -5,17 +5,20 @@ import datetime
 import math
 from arcpy import Geometry
 
+
 class Toolbox(object):
     def __init__(self):
         self.label = "Drillholes from Polygon Generator"
         self.alias = "polygon_to_profiles"
         self.tools = [PolygonToProfiles]
 
+
 class PolygonToProfiles(object):
     def __init__(self):
         self.label = "Generate Profiles and Collars from Polygon"
         self.description = "Generates polylines at specified azimuth and spacing inside a polygon, then calculates total depth or generates collar points."
         self.canRunInBackground = False
+
 
     @staticmethod
     def getParameterInfo():
@@ -81,9 +84,11 @@ class PolygonToProfiles(object):
 
         return params
 
+
     @staticmethod
     def isLicensed():
         return True
+
 
     @staticmethod
     def updateParameters(parameters):
@@ -95,6 +100,7 @@ class PolygonToProfiles(object):
 
     def updateMessages(self, parameters):
         return
+
 
     def execute(self, parameters, messages):
         try:
@@ -143,6 +149,7 @@ class PolygonToProfiles(object):
                     arcpy.AddMessage(f"{name} удалён")
         except:
             arcpy.AddWarning("Temporary objects are not deleted")
+
 
     @staticmethod
     def generate_profiles(polygon_layer, spacing, azimuth, output_fc, utm_zone):
@@ -227,6 +234,7 @@ class PolygonToProfiles(object):
         except Exception as e:
             arcpy.AddError(f"Generate profiles error: {e}")
 
+
     @staticmethod
     def generate_points(line_layer, interval, output_fc):
         try:
@@ -254,6 +262,7 @@ class PolygonToProfiles(object):
 
         except Exception as e:
             arcpy.AddError(f"Error generating points: {e}")
+
 
     @staticmethod
     def cutting_by_polygon(polygon_layer, line_fc, point_fc):
@@ -308,6 +317,7 @@ class PolygonToProfiles(object):
         except Exception as e:
             arcpy.AddError("Cutting by polygon error: " + str(e))
 
+
     @staticmethod
     def add_depths(line_layer, interval, avg_depth, field, log_folder):
         try:
@@ -335,6 +345,7 @@ class PolygonToProfiles(object):
         except Exception as e:
             arcpy.AddError(f"Error in add_depths: {e}")
 
+
     @staticmethod
     def add_layer_to_map(layer_path, layer_name):
         try:
@@ -344,6 +355,7 @@ class PolygonToProfiles(object):
                 active_map.addDataFromPath(layer_path)
         except Exception as e:
             arcpy.AddWarning(f"Layer {layer_name} was not added to map {e}")
+
 
 class CuttingHelper:
     @staticmethod
